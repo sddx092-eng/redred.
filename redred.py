@@ -6,7 +6,7 @@ from discord.ui import View, Button
 import yt_dlp
 
 # =============================================================
-# 0. Render 환경변수 쿠키 자동 복원 (있는 경우)
+# 0. Render 환경변수 쿠키 자동 복원
 # =============================================================
 cookies_env = os.getenv("YOUTUBE_COOKIES")
 if cookies_env:
@@ -23,10 +23,10 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 음성 대기열 관리 (길드 ID별 목록)
+# 음성 대기열 관리
 music_queues = {}
 
-# yt-dlp 옵션 (모바일 앱 위장으로 유튜브 차단 회피)
+# yt-dlp 옵션
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'extract_flat': False,
@@ -37,8 +37,7 @@ YTDL_OPTIONS = {
     'source_address': '0.0.0.0',
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'ios'],
-            'skip': ['hls', 'dash']
+            'player_client': ['ios', 'android', 'mweb']
         }
     }
 }
@@ -60,13 +59,13 @@ def play_next(ctx):
         ctx.voice_client.play(source, after=lambda e: play_next(ctx))
         
         embed = discord.Embed(
-            title="다음 곡 재생",
+            title="🎵 다음 곡 재생",
             description=f"**[{next_song['title']}]({next_song['url']})**",
             color=0x2b2d31
         )
         asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
     else:
-        if ctx.voice_client:
+        if ctx.voice_client and ctx.voice_client.is_connected():
             asyncio.run_coroutine_threadsafe(ctx.voice_client.disconnect(), bot.loop)
         
         embed = discord.Embed(
@@ -90,11 +89,12 @@ class MusicControlView(View):
             await interaction.response.send_message("명령어를 입력한 사용자만 조작할 수 있습니다.", ephemeral=True)
             return
 
-        await interaction.response.defer()
-        self.stop()
-
         # 음성 채널 접속 처리
-        channel = self.ctx.author.voice.channel
+        channel = self.ctx.author.voice.channel if self.ctx.author.voice else None
+        if not channel:
+            await interaction.response.send_message("음성 채널에 먼저 입장해 주세요.", ephemeral=True)
+            return
+
         try:
             if self.ctx.voice_client is None:
                 await channel.connect(reconnect=True, self_deaf=True)
@@ -102,10 +102,9 @@ class MusicControlView(View):
                 await self.ctx.voice_client.move_to(channel)
         except Exception as e:
             embed = discord.Embed(description="음성 채널 연결 실패. 다시 시도해 주세요.", color=0x2b2d31)
-            await self.ctx.send(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 대기열 등록 및 재생
         guild_id = self.ctx.guild.id
         if guild_id not in music_queues:
             music_queues[guild_id] = []
@@ -113,26 +112,29 @@ class MusicControlView(View):
         title = self.song_info['title']
         stream_url = self.song_info['stream_url']
         song_url = self.song_info['url']
-
         song_item = {'title': title, 'url': song_url, 'stream_url': stream_url}
 
+        self.stop()
+
+        # 이미 재생 중인 경우 -> 대기열 추가 (기존 메시지를 수정하여 2번 안 뜨게 함)
         if self.ctx.voice_client.is_playing() or self.ctx.voice_client.is_paused():
             music_queues[guild_id].append(song_item)
             embed = discord.Embed(
-                title="대기열 추가",
-                description=f"**[{title}]({song_url})**\n대기 순서: {len(music_queues[guild_id])}번째",
+                title="📝 대기열 추가",
+                description=f"**[{title}]({song_url})**\n\n대기 순서: **{len(music_queues[guild_id])}번째**",
                 color=0x2b2d31
             )
-            await self.ctx.send(embed=embed)
+            await interaction.response.edit_message(embed=embed, view=None)
+        # 새로 재생하는 경우 -> 바로 재생
         else:
             source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
             self.ctx.voice_client.play(source, after=lambda e: play_next(self.ctx))
             embed = discord.Embed(
-                title="현재 재생 중",
+                title="▶️ 현재 재생 중",
                 description=f"**[{title}]({song_url})**",
                 color=0x2b2d31
             )
-            await self.ctx.send(embed=embed)
+            await interaction.response.edit_message(embed=embed, view=None)
 
     @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
@@ -141,7 +143,7 @@ class MusicControlView(View):
             return
 
         self.stop()
-        embed = discord.Embed(description="재생이 취소되었습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="❌ 재생이 취소되었습니다.", color=0x2b2d31)
         await interaction.response.edit_message(embed=embed, view=None)
 
 # =============================================================
@@ -190,14 +192,13 @@ async def play(ctx, *, search: str = None):
                 uploader = song_info.get('uploader', '채널 정보 없음')
 
         except Exception as e:
-            embed = discord.Embed(description="음원 정보를 가져올 수 없습니다. (유튜브 접속 제한)", color=0x2b2d31)
+            embed = discord.Embed(description="음원 정보를 가져올 수 없습니다. (유튜브 접속 제한 또는 최신 업데이트 필요)", color=0x2b2d31)
             await ctx.send(embed=embed)
             print(f"YTDL Error: {e}")
             return
 
-    # 검색 결과 임베드 카드 생성
     embed = discord.Embed(
-        title="검색 결과 확인",
+        title="🔍 검색 결과 확인",
         description=f"**[{title}]({song_url})**\n\n채널: {uploader}",
         color=0x2b2d31
     )
@@ -215,7 +216,7 @@ async def play(ctx, *, search: str = None):
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        embed = discord.Embed(description="현재 곡을 스킵했습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="⏭️ 현재 곡을 스킵했습니다.", color=0x2b2d31)
         await ctx.send(embed=embed)
     else:
         embed = discord.Embed(description="재생 중인 음악이 없습니다.", color=0x2b2d31)
@@ -234,7 +235,7 @@ async def stop(ctx):
             await ctx.voice_client.disconnect(force=True)
         except Exception as e:
             print(f"Disconnect Error: {e}")
-        embed = discord.Embed(description="재생을 정지하고 음성 채널에서 퇴장했습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="⏹️ 재생을 정지하고 음성 채널에서 퇴장했습니다.", color=0x2b2d31)
         await ctx.send(embed=embed)
     else:
         embed = discord.Embed(description="봇이 음성 채널에 연결되어 있지 않습니다.", color=0x2b2d31)
@@ -254,7 +255,7 @@ async def queue_list(ctx):
         description += f"**{idx}.** [{song['title']}]({song['url']})\n"
 
     embed = discord.Embed(
-        title="현재 대기열 목록",
+        title="📜 현재 대기열 목록",
         description=description,
         color=0x2b2d31
     )
