@@ -7,20 +7,9 @@ import yt_dlp
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-# =============================================================
-# 0. UI 색상 테마 정의 (3색)
-# =============================================================
-COLOR_PLAY = 0x5865F2  # 파란색 (재생 중, 다음 곡)
-COLOR_INFO = 0x2B2D31  # 다크그레이 (검색, 대기열 추가, 목록)
-COLOR_WARN = 0xED4245  # 빨간색 (오류, 스킵, 정지, 취소)
-
-# =============================================================
-# 1. 환경변수 및 봇 설정
-# =============================================================
-cookies_env = os.getenv("YOUTUBE_COOKIES")
-if cookies_env:
-    with open("cookies.txt", "w", encoding="utf-8") as f:
-        f.write(cookies_env)
+COLOR_PLAY = 0x5865F2
+COLOR_INFO = 0x2B2D31
+COLOR_WARN = 0xED4245
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
@@ -30,18 +19,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 music_queues = {}
 
-# 포맷 에러 해결 및 쿠키 연동이 적용된 yt-dlp 옵션
+# 쿠키 없이 유튜브 차단을 우회하기 위한 최신 옵션 설정
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'extract_flat': False,
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
-    'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
     'source_address': '0.0.0.0',
     'extractor_args': {
         'youtube': {
-            'player_client': ['android', 'web']
+            'player_client': ['mweb', 'ios']
         }
     }
 }
@@ -51,9 +39,6 @@ FFMPEG_OPTIONS = {
     'options': '-vn',
 }
 
-# =============================================================
-# 2. 대기열 다음 곡 재생 함수
-# =============================================================
 def play_next(ctx):
     guild_id = ctx.guild.id
     if guild_id in music_queues and len(music_queues[guild_id]) > 0:
@@ -79,9 +64,6 @@ def play_next(ctx):
                 )
                 asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
 
-# =============================================================
-# 3. 버튼 메뉴 뷰 (View) 클래스
-# =============================================================
 class MusicControlView(View):
     def __init__(self, ctx, song_info):
         super().__init__(timeout=60)
@@ -150,9 +132,6 @@ class MusicControlView(View):
         embed = discord.Embed(description="❌ 재생이 취소되었어.", color=COLOR_WARN)
         await interaction.response.edit_message(embed=embed, view=None)
 
-# =============================================================
-# 4. 봇 명령어
-# =============================================================
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name}")
@@ -191,7 +170,7 @@ async def play(ctx, *, search: str = None):
                 uploader = song_info.get('uploader', '채널 정보 없음')
 
         except Exception as e:
-            embed = discord.Embed(description="음원 정보를 가져올 수 없어. (포맷 에러 또는 쿠키 만료 확인 필요)", color=COLOR_WARN)
+            embed = discord.Embed(description="음원 정보를 가져올 수 없어. (유튜브 차단 우회 실패)", color=COLOR_WARN)
             await ctx.send(embed=embed)
             print(f"YTDL Error: {e}")
             return
@@ -256,9 +235,6 @@ async def queue_list(ctx):
     )
     await ctx.send(embed=embed)
 
-# =============================================================
-# 5. Render 포트 유지용 웹 서버
-# =============================================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
