@@ -3,7 +3,7 @@ import random
 import asyncio
 import discord
 from discord.ext import commands
-import yt-dlp
+import yt_dlp
 
 # -------------------------------------------------------------
 # 봇 기본 설정 및 Intents 설정
