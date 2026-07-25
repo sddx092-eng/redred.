@@ -2,6 +2,7 @@ import os
 import asyncio
 import discord
 from discord.ext import commands
+from discord.ui import View, Button
 import yt_dlp
 
 # =============================================================
@@ -25,7 +26,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # 음성 대기열 관리 (길드 ID별 목록)
 music_queues = {}
 
-# yt-dlp 옵션
+# yt-dlp 옵션 (모바일 앱 위장으로 유튜브 차단 회피)
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'extract_flat': False,
@@ -34,6 +35,12 @@ YTDL_OPTIONS = {
     'no_warnings': True,
     'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
     'source_address': '0.0.0.0',
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'ios'],
+            'skip': ['hls', 'dash']
+        }
+    }
 }
 
 # FFmpeg 옵션
@@ -51,21 +58,94 @@ def play_next(ctx):
         next_song = music_queues[guild_id].pop(0)
         source = discord.FFmpegPCMAudio(next_song['stream_url'], **FFMPEG_OPTIONS)
         ctx.voice_client.play(source, after=lambda e: play_next(ctx))
-        asyncio.run_coroutine_threadsafe(
-            ctx.send(f"▶ 다음 곡 재생: **{next_song['title']}**"),
-            bot.loop
+        
+        embed = discord.Embed(
+            title="다음 곡 재생",
+            description=f"**[{next_song['title']}]({next_song['url']})**",
+            color=0x2b2d31
         )
+        asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
     else:
-        # 재생이 끝나면 자동으로 채널 나가기
         if ctx.voice_client:
             asyncio.run_coroutine_threadsafe(ctx.voice_client.disconnect(), bot.loop)
-        asyncio.run_coroutine_threadsafe(
-            ctx.send("■ 대기열의 모든 노래가 재생되어 음성 채널에서 퇴장했습니다."),
-            bot.loop
+        
+        embed = discord.Embed(
+            description="대기열의 모든 노래 재생이 완료되어 음성 채널에서 퇴장했습니다.",
+            color=0x2b2d31
         )
+        asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
 
 # =============================================================
-# 3. 봇 이벤트
+# 3. 버튼 메뉴 뷰 (View) 클래스
+# =============================================================
+class MusicControlView(View):
+    def __init__(self, ctx, song_info):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+        self.song_info = song_info
+
+    @discord.ui.button(label="재생 확정", style=discord.ButtonStyle.primary)
+    async def confirm_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("명령어를 입력한 사용자만 조작할 수 있습니다.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        self.stop()
+
+        # 음성 채널 접속 처리
+        channel = self.ctx.author.voice.channel
+        try:
+            if self.ctx.voice_client is None:
+                await channel.connect(reconnect=True, self_deaf=True)
+            elif self.ctx.voice_client.channel.id != channel.id:
+                await self.ctx.voice_client.move_to(channel)
+        except Exception as e:
+            embed = discord.Embed(description="음성 채널 연결 실패. 다시 시도해 주세요.", color=0x2b2d31)
+            await self.ctx.send(embed=embed)
+            return
+
+        # 대기열 등록 및 재생
+        guild_id = self.ctx.guild.id
+        if guild_id not in music_queues:
+            music_queues[guild_id] = []
+
+        title = self.song_info['title']
+        stream_url = self.song_info['stream_url']
+        song_url = self.song_info['url']
+
+        song_item = {'title': title, 'url': song_url, 'stream_url': stream_url}
+
+        if self.ctx.voice_client.is_playing() or self.ctx.voice_client.is_paused():
+            music_queues[guild_id].append(song_item)
+            embed = discord.Embed(
+                title="대기열 추가",
+                description=f"**[{title}]({song_url})**\n대기 순서: {len(music_queues[guild_id])}번째",
+                color=0x2b2d31
+            )
+            await self.ctx.send(embed=embed)
+        else:
+            source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+            self.ctx.voice_client.play(source, after=lambda e: play_next(self.ctx))
+            embed = discord.Embed(
+                title="현재 재생 중",
+                description=f"**[{title}]({song_url})**",
+                color=0x2b2d31
+            )
+            await self.ctx.send(embed=embed)
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user != self.ctx.author:
+            await interaction.response.send_message("명령어를 입력한 사용자만 조작할 수 있습니다.", ephemeral=True)
+            return
+
+        self.stop()
+        embed = discord.Embed(description="재생이 취소되었습니다.", color=0x2b2d31)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+# =============================================================
+# 4. 봇 이벤트 handlers
 # =============================================================
 @bot.event
 async def on_ready():
@@ -73,43 +153,32 @@ async def on_ready():
     print("--------------------------------------------")
 
 # =============================================================
-# 4. 음악 명령어 목록
+# 5. 음악 명령어 목록
 # =============================================================
 
-# [ !재생 / !p ] -> 검색 시 첫 번째 검색 결과 바로 재생
+# [ !재생 / !p ]
 @bot.command(name="재생", aliases=["play", "p"])
 async def play(ctx, *, search: str = None):
     if search is None:
-        await ctx.send("▶ 재생할 노래 제목이나 링크를 입력해 주세요. (예: `!재생 뉴진스 Hype Boy`)")
+        embed = discord.Embed(description="재생할 노래 제목이나 링크를 입력해 주세요. (예: `!재생 뉴진스`)", color=0x2b2d31)
+        await ctx.send(embed=embed)
         return
 
     if not ctx.author.voice:
-        await ctx.send("▶ 먼저 음성 채널에 입장해 주세요.")
+        embed = discord.Embed(description="먼저 음성 채널에 입장해 주세요.", color=0x2b2d31)
+        await ctx.send(embed=embed)
         return
 
-    # 1. 음성 채널 연결 상태 점검 및 안전 접속
-    channel = ctx.author.voice.channel
-    try:
-        if ctx.voice_client is None:
-            await channel.connect(reconnect=True, self_deaf=True)
-        elif ctx.voice_client.channel.id != channel.id:
-            await ctx.voice_client.move_to(channel)
-    except Exception as e:
-        await ctx.send("▶ 음성 채널에 연결할 수 없습니다. 봇을 다시 시도하거나 `!정지` 후 실행해 주세요.")
-        print(f"Voice Connect Error: {e}")
-        return
-
-    # 2. 유튜브 정보 추출 (1등 결과 바로 가져오기)
     async with ctx.typing():
         try:
             with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
-                # search가 url이 아닌 일반 키워드면 ytsearch로 검색
                 query = search if search.startswith('http') else f"ytsearch1:{search}"
                 info = ytdl.extract_info(query, download=False)
                 
                 if 'entries' in info:
                     if not info['entries']:
-                        await ctx.send("▶ 검색 결과가 없습니다.")
+                        embed = discord.Embed(description="검색 결과가 없습니다.", color=0x2b2d31)
+                        await ctx.send(embed=embed)
                         return
                     song_info = info['entries'][0]
                 else:
@@ -118,37 +187,41 @@ async def play(ctx, *, search: str = None):
                 stream_url = song_info['url']
                 title = song_info.get('title', '제목 없음')
                 song_url = song_info.get('webpage_url', search)
+                uploader = song_info.get('uploader', '채널 정보 없음')
 
         except Exception as e:
-            await ctx.send("▶ 음원 정보를 가져오지 못했습니다. (유튜브 차단 제약)")
+            embed = discord.Embed(description="음원 정보를 가져올 수 없습니다. (유튜브 접속 제한)", color=0x2b2d31)
+            await ctx.send(embed=embed)
             print(f"YTDL Error: {e}")
             return
 
-    song_item = {'title': title, 'url': song_url, 'stream_url': stream_url}
-    guild_id = ctx.guild.id
+    # 검색 결과 임베드 카드 생성
+    embed = discord.Embed(
+        title="검색 결과 확인",
+        description=f"**[{title}]({song_url})**\n\n채널: {uploader}",
+        color=0x2b2d31
+    )
+    
+    view = MusicControlView(ctx, {
+        'title': title,
+        'url': song_url,
+        'stream_url': stream_url
+    })
 
-    if guild_id not in music_queues:
-        music_queues[guild_id] = []
-
-    # 3. 재생 중이면 대기열에 넣고, 없으면 즉시 재생
-    if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-        music_queues[guild_id].append(song_item)
-        await ctx.send(f" 대기열 추가: **{title}** ({len(music_queues[guild_id])}번째)")
-    else:
-        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-        ctx.voice_client.play(source, after=lambda e: play_next(ctx))
-        await ctx.send(f"▶ 재생 시작: **{title}**")
+    await ctx.send(embed=embed, view=view)
 
 # [ !스킵 / !s ]
 @bot.command(name="스킵", aliases=["skip", "s"])
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        await ctx.send("▶ 현재 곡을 스킵했습니다.")
+        embed = discord.Embed(description="현재 곡을 스킵했습니다.", color=0x2b2d31)
+        await ctx.send(embed=embed)
     else:
-        await ctx.send("▶ 재생 중인 음악이 없습니다.")
+        embed = discord.Embed(description="재생 중인 음악이 없습니다.", color=0x2b2d31)
+        await ctx.send(embed=embed)
 
-# [ !정지 / !stop ] -> 꼬인 연결 강제 종료 기능 포함
+# [ !정지 / !stop ]
 @bot.command(name="정지", aliases=["stop"])
 async def stop(ctx):
     guild_id = ctx.guild.id
@@ -161,26 +234,34 @@ async def stop(ctx):
             await ctx.voice_client.disconnect(force=True)
         except Exception as e:
             print(f"Disconnect Error: {e}")
-        await ctx.send("■ 재생을 정지하고 음성 채널에서 퇴장했습니다.")
+        embed = discord.Embed(description="재생을 정지하고 음성 채널에서 퇴장했습니다.", color=0x2b2d31)
+        await ctx.send(embed=embed)
     else:
-        await ctx.send("▶ 봇이 연결되어 있지 않습니다.")
+        embed = discord.Embed(description="봇이 음성 채널에 연결되어 있지 않습니다.", color=0x2b2d31)
+        await ctx.send(embed=embed)
 
 # [ !목록 / !q ]
 @bot.command(name="목록", aliases=["queue", "q"])
 async def queue_list(ctx):
     guild_id = ctx.guild.id
     if guild_id not in music_queues or len(music_queues[guild_id]) == 0:
-        await ctx.send("▶ 대기열이 비어 있습니다.")
+        embed = discord.Embed(description="대기열이 비어 있습니다.", color=0x2b2d31)
+        await ctx.send(embed=embed)
         return
 
-    msg = "**[ 대기열 목록 ]**\n"
+    description = ""
     for idx, song in enumerate(music_queues[guild_id], 1):
-        msg += f"{idx}. {song['title']}\n"
+        description += f"**{idx}.** [{song['title']}]({song['url']})\n"
 
-    await ctx.send(msg)
+    embed = discord.Embed(
+        title="현재 대기열 목록",
+        description=description,
+        color=0x2b2d31
+    )
+    await ctx.send(embed=embed)
 
 # =============================================================
-# 5. 봇 실행
+# 6. 봇 실행
 # =============================================================
 if __name__ == "__main__":
     if TOKEN:
