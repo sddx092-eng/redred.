@@ -4,6 +4,8 @@ import discord
 from discord.ext import commands
 from discord.ui import View, Button
 import yt_dlp
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 # =============================================================
 # 0. UI 색상 테마 정의 (3색)
@@ -28,14 +30,20 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 music_queues = {}
 
+# 포맷 에러 해결 및 쿠키 연동이 적용된 yt-dlp 옵션
 YTDL_OPTIONS = {
-    'format': 'ba/bestaudio/best',
+    'format': 'bestaudio/best',
     'extract_flat': False,
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
     'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
     'source_address': '0.0.0.0',
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'web']
+        }
+    }
 }
 
 FFMPEG_OPTIONS = {
@@ -61,7 +69,6 @@ def play_next(ctx):
         asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
     else:
         if ctx.voice_client and ctx.voice_client.is_connected():
-            # 강제 정지(!정지)로 인한 종료가 아닐 때만 완료 메시지 전송 (중복 방지)
             is_forced = getattr(ctx.voice_client, 'is_forced_stop', False)
             asyncio.run_coroutine_threadsafe(ctx.voice_client.disconnect(), bot.loop)
             
@@ -102,7 +109,6 @@ class MusicControlView(View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 강제 정지 플래그 초기화
         self.ctx.voice_client.is_forced_stop = False
 
         guild_id = self.ctx.guild.id
@@ -185,8 +191,9 @@ async def play(ctx, *, search: str = None):
                 uploader = song_info.get('uploader', '채널 정보 없음')
 
         except Exception as e:
-            embed = discord.Embed(description="음원 정보를 가져올 수 없어. (연령 제한 또는 유튜브 업데이트 필요)", color=COLOR_WARN)
+            embed = discord.Embed(description="음원 정보를 가져올 수 없어. (포맷 에러 또는 쿠키 만료 확인 필요)", color=COLOR_WARN)
             await ctx.send(embed=embed)
+            print(f"YTDL Error: {e}")
             return
 
     embed = discord.Embed(
@@ -206,7 +213,7 @@ async def play(ctx, *, search: str = None):
 @bot.command(name="스킵", aliases=["skip", "s"])
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop() # stop()을 호출하면 자동으로 play_next가 실행됨
+        ctx.voice_client.stop()
         embed = discord.Embed(description="⏭️ 곡을 스킵했어.", color=COLOR_WARN)
         await ctx.send(embed=embed)
     else:
@@ -220,8 +227,7 @@ async def stop(ctx):
         music_queues[guild_id].clear()
 
     if ctx.voice_client:
-        # 강제 정지 플래그를 세워서 play_next()가 불필요한 메시지를 안 보내게 차단
-        ctx.voice_client.is_forced_stop = True 
+        ctx.voice_client.is_forced_stop = True
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect(force=True)
         
@@ -250,8 +256,23 @@ async def queue_list(ctx):
     )
     await ctx.send(embed=embed)
 
+# =============================================================
+# 5. Render 포트 유지용 웹 서버
+# =============================================================
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"YouTube Music Bot is running!")
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
 if __name__ == "__main__":
     if TOKEN:
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
         bot.run(TOKEN)
     else:
         print("Error: DISCORD_TOKEN 환경변수가 없어.")
