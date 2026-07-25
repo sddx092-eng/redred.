@@ -6,43 +6,38 @@ from discord.ui import View, Button
 import yt_dlp
 
 # =============================================================
-# 0. Render 환경변수 쿠키 자동 복원
+# 0. UI 색상 테마 정의 (3색)
+# =============================================================
+COLOR_PLAY = 0x5865F2  # 파란색 (재생 중, 다음 곡)
+COLOR_INFO = 0x2B2D31  # 다크그레이 (검색, 대기열 추가, 목록)
+COLOR_WARN = 0xED4245  # 빨간색 (오류, 스킵, 정지, 취소)
+
+# =============================================================
+# 1. 환경변수 및 봇 설정
 # =============================================================
 cookies_env = os.getenv("YOUTUBE_COOKIES")
 if cookies_env:
     with open("cookies.txt", "w", encoding="utf-8") as f:
         f.write(cookies_env)
 
-# =============================================================
-# 1. 디스코드 봇 설정
-# =============================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 음성 대기열 관리
 music_queues = {}
 
-# yt-dlp 옵션
 YTDL_OPTIONS = {
-    'format': 'bestaudio/best',
+    'format': 'ba/bestaudio/best',
     'extract_flat': False,
     'noplaylist': True,
     'quiet': True,
     'no_warnings': True,
     'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
     'source_address': '0.0.0.0',
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['ios', 'android', 'mweb']
-        }
-    }
 }
 
-# FFmpeg 옵션
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
@@ -61,18 +56,21 @@ def play_next(ctx):
         embed = discord.Embed(
             title="🎵 다음 곡 재생",
             description=f"**[{next_song['title']}]({next_song['url']})**",
-            color=0x2b2d31
+            color=COLOR_PLAY
         )
         asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
     else:
         if ctx.voice_client and ctx.voice_client.is_connected():
+            # 강제 정지(!정지)로 인한 종료가 아닐 때만 완료 메시지 전송 (중복 방지)
+            is_forced = getattr(ctx.voice_client, 'is_forced_stop', False)
             asyncio.run_coroutine_threadsafe(ctx.voice_client.disconnect(), bot.loop)
-        
-        embed = discord.Embed(
-            description="대기열의 모든 노래 재생이 완료되어 음성 채널에서 퇴장했습니다.",
-            color=0x2b2d31
-        )
-        asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
+            
+            if not is_forced:
+                embed = discord.Embed(
+                    description="✅ 대기열의 모든 곡 재생이 완료되어 퇴장했습니다.",
+                    color=COLOR_INFO
+                )
+                asyncio.run_coroutine_threadsafe(ctx.send(embed=embed), bot.loop)
 
 # =============================================================
 # 3. 버튼 메뉴 뷰 (View) 클래스
@@ -86,13 +84,12 @@ class MusicControlView(View):
     @discord.ui.button(label="재생 확정", style=discord.ButtonStyle.primary)
     async def confirm_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.ctx.author:
-            await interaction.response.send_message("명령어를 입력한 사용자만 조작할 수 있습니다.", ephemeral=True)
+            await interaction.response.send_message("명령어를 입력한 사람만 누를 수 있어.", ephemeral=True)
             return
 
-        # 음성 채널 접속 처리
         channel = self.ctx.author.voice.channel if self.ctx.author.voice else None
         if not channel:
-            await interaction.response.send_message("음성 채널에 먼저 입장해 주세요.", ephemeral=True)
+            await interaction.response.send_message("음성 채널에 먼저 들어가 줘.", ephemeral=True)
             return
 
         try:
@@ -101,9 +98,12 @@ class MusicControlView(View):
             elif self.ctx.voice_client.channel.id != channel.id:
                 await self.ctx.voice_client.move_to(channel)
         except Exception as e:
-            embed = discord.Embed(description="음성 채널 연결 실패. 다시 시도해 주세요.", color=0x2b2d31)
+            embed = discord.Embed(description="음성 채널 연결에 실패했어.", color=COLOR_WARN)
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
+
+        # 강제 정지 플래그 초기화
+        self.ctx.voice_client.is_forced_stop = False
 
         guild_id = self.ctx.guild.id
         if guild_id not in music_queues:
@@ -116,58 +116,51 @@ class MusicControlView(View):
 
         self.stop()
 
-        # 이미 재생 중인 경우 -> 대기열 추가 (기존 메시지를 수정하여 2번 안 뜨게 함)
         if self.ctx.voice_client.is_playing() or self.ctx.voice_client.is_paused():
             music_queues[guild_id].append(song_item)
             embed = discord.Embed(
                 title="📝 대기열 추가",
                 description=f"**[{title}]({song_url})**\n\n대기 순서: **{len(music_queues[guild_id])}번째**",
-                color=0x2b2d31
+                color=COLOR_INFO
             )
             await interaction.response.edit_message(embed=embed, view=None)
-        # 새로 재생하는 경우 -> 바로 재생
         else:
             source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
             self.ctx.voice_client.play(source, after=lambda e: play_next(self.ctx))
             embed = discord.Embed(
                 title="▶️ 현재 재생 중",
                 description=f"**[{title}]({song_url})**",
-                color=0x2b2d31
+                color=COLOR_PLAY
             )
             await interaction.response.edit_message(embed=embed, view=None)
 
-    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: Button):
         if interaction.user != self.ctx.author:
-            await interaction.response.send_message("명령어를 입력한 사용자만 조작할 수 있습니다.", ephemeral=True)
+            await interaction.response.send_message("명령어를 입력한 사람만 누를 수 있어.", ephemeral=True)
             return
 
         self.stop()
-        embed = discord.Embed(description="❌ 재생이 취소되었습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="❌ 재생이 취소되었어.", color=COLOR_WARN)
         await interaction.response.edit_message(embed=embed, view=None)
 
 # =============================================================
-# 4. 봇 이벤트 handlers
+# 4. 봇 명령어
 # =============================================================
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user.name} ({bot.user.id})")
+    print(f"Logged in as {bot.user.name}")
     print("--------------------------------------------")
 
-# =============================================================
-# 5. 음악 명령어 목록
-# =============================================================
-
-# [ !재생 / !p ]
 @bot.command(name="재생", aliases=["play", "p"])
 async def play(ctx, *, search: str = None):
     if search is None:
-        embed = discord.Embed(description="재생할 노래 제목이나 링크를 입력해 주세요. (예: `!재생 뉴진스`)", color=0x2b2d31)
+        embed = discord.Embed(description="노래 제목이나 링크를 입력해 줘. (예: `!재생 뉴진스`)", color=COLOR_WARN)
         await ctx.send(embed=embed)
         return
 
     if not ctx.author.voice:
-        embed = discord.Embed(description="먼저 음성 채널에 입장해 주세요.", color=0x2b2d31)
+        embed = discord.Embed(description="먼저 음성 채널에 입장해 줘.", color=COLOR_WARN)
         await ctx.send(embed=embed)
         return
 
@@ -179,7 +172,7 @@ async def play(ctx, *, search: str = None):
                 
                 if 'entries' in info:
                     if not info['entries']:
-                        embed = discord.Embed(description="검색 결과가 없습니다.", color=0x2b2d31)
+                        embed = discord.Embed(description="검색 결과가 없어.", color=COLOR_WARN)
                         await ctx.send(embed=embed)
                         return
                     song_info = info['entries'][0]
@@ -192,15 +185,14 @@ async def play(ctx, *, search: str = None):
                 uploader = song_info.get('uploader', '채널 정보 없음')
 
         except Exception as e:
-            embed = discord.Embed(description="음원 정보를 가져올 수 없습니다. (유튜브 접속 제한 또는 최신 업데이트 필요)", color=0x2b2d31)
+            embed = discord.Embed(description="음원 정보를 가져올 수 없어. (연령 제한 또는 유튜브 업데이트 필요)", color=COLOR_WARN)
             await ctx.send(embed=embed)
-            print(f"YTDL Error: {e}")
             return
 
     embed = discord.Embed(
         title="🔍 검색 결과 확인",
         description=f"**[{title}]({song_url})**\n\n채널: {uploader}",
-        color=0x2b2d31
+        color=COLOR_INFO
     )
     
     view = MusicControlView(ctx, {
@@ -211,18 +203,16 @@ async def play(ctx, *, search: str = None):
 
     await ctx.send(embed=embed, view=view)
 
-# [ !스킵 / !s ]
 @bot.command(name="스킵", aliases=["skip", "s"])
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-        embed = discord.Embed(description="⏭️ 현재 곡을 스킵했습니다.", color=0x2b2d31)
+        ctx.voice_client.stop() # stop()을 호출하면 자동으로 play_next가 실행됨
+        embed = discord.Embed(description="⏭️ 곡을 스킵했어.", color=COLOR_WARN)
         await ctx.send(embed=embed)
     else:
-        embed = discord.Embed(description="재생 중인 음악이 없습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="재생 중인 음악이 없어.", color=COLOR_WARN)
         await ctx.send(embed=embed)
 
-# [ !정지 / !stop ]
 @bot.command(name="정지", aliases=["stop"])
 async def stop(ctx):
     guild_id = ctx.guild.id
@@ -230,23 +220,22 @@ async def stop(ctx):
         music_queues[guild_id].clear()
 
     if ctx.voice_client:
-        try:
-            ctx.voice_client.stop()
-            await ctx.voice_client.disconnect(force=True)
-        except Exception as e:
-            print(f"Disconnect Error: {e}")
-        embed = discord.Embed(description="⏹️ 재생을 정지하고 음성 채널에서 퇴장했습니다.", color=0x2b2d31)
+        # 강제 정지 플래그를 세워서 play_next()가 불필요한 메시지를 안 보내게 차단
+        ctx.voice_client.is_forced_stop = True 
+        ctx.voice_client.stop()
+        await ctx.voice_client.disconnect(force=True)
+        
+        embed = discord.Embed(description="⏹️ 재생을 정지하고 대기열을 비웠어.", color=COLOR_WARN)
         await ctx.send(embed=embed)
     else:
-        embed = discord.Embed(description="봇이 음성 채널에 연결되어 있지 않습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="연결된 음성 채널이 없어.", color=COLOR_WARN)
         await ctx.send(embed=embed)
 
-# [ !목록 / !q ]
 @bot.command(name="목록", aliases=["queue", "q"])
 async def queue_list(ctx):
     guild_id = ctx.guild.id
     if guild_id not in music_queues or len(music_queues[guild_id]) == 0:
-        embed = discord.Embed(description="대기열이 비어 있습니다.", color=0x2b2d31)
+        embed = discord.Embed(description="대기열이 비어 있어.", color=COLOR_INFO)
         await ctx.send(embed=embed)
         return
 
@@ -255,17 +244,14 @@ async def queue_list(ctx):
         description += f"**{idx}.** [{song['title']}]({song['url']})\n"
 
     embed = discord.Embed(
-        title="📜 현재 대기열 목록",
+        title="📜 현재 대기열",
         description=description,
-        color=0x2b2d31
+        color=COLOR_INFO
     )
     await ctx.send(embed=embed)
 
-# =============================================================
-# 6. 봇 실행
-# =============================================================
 if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("Error: DISCORD_TOKEN 환경변수가 설정되지 않았습니다.")
+        print("Error: DISCORD_TOKEN 환경변수가 없어.")
